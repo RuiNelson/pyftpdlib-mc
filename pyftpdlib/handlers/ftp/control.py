@@ -35,6 +35,10 @@ from pyftpdlib.utils import strerror
 from .data import DTPHandler
 from .dispatchers import ActiveDTP
 from .dispatchers import PassiveDTP
+from .mc import MC_MAX_STRIPE
+from .mc import MCActive
+from .mc import MCDataSet
+from .mc import MCPassive
 from .producers import BufferedIteratorProducer
 from .producers import FileProducer
 
@@ -136,6 +140,21 @@ proto_cmds = {
         auth=True,
         arg=True,
         help="Syntax: MODE <SP> mode (noop; set data transfer mode).",
+    ),
+    "MPRT": dict(
+        perm=None,
+        auth=True,
+        arg=True,
+        help=(
+            "Syntax: MPRT <SP> |proto|ip|port,port,...| (FTPMC active"
+            " mode, one port per data connection)."
+        ),
+    ),
+    "MPSV": dict(
+        perm=None,
+        auth=True,
+        arg=False,
+        help="Syntax: MPSV (FTPMC passive mode, N data connections).",
     ),
     "MKD": dict(
         perm="m",
@@ -402,6 +421,18 @@ class FTPHandler(AsyncChat):
        the prefix string preceding any log line; all instance
        attributes can be used as arguments.
 
+     - (int) mc_max_connections:
+        the largest number of data connections per transfer accepted
+        with FTPMC (OPTS MC); 0 disables FTPMC (default 16).
+
+     - (int) mc_max_stripe:
+        the largest FTPMC stripe size the server accepts; larger
+        requests are lowered to it (default 16 MiB).
+
+     - (int) mc_buffer_size:
+        buffer size per FTPMC data connection; the buffer is never
+        smaller than twice the stripe size (default 1 MiB).
+
 
     All relevant instance attributes initialized when client connects
     are reproduced below.  You may be interested in them in case you
@@ -442,6 +473,10 @@ class FTPHandler(AsyncChat):
     unicode_errors = "replace"
     log_prefix = "%(remote_ip)s:%(remote_port)s-[%(username)s]"
     auth_failed_timeout = 3
+    mc_max_connections = 16
+    mc_max_stripe = 16 * 1024 * 1024
+    mc_buffer_size = 1024 * 1024
+    mc_default_stripe = 4096
 
     def __init__(self, conn, server, ioloop=None):
         """Initialize the command channel.
@@ -478,6 +513,13 @@ class FTPHandler(AsyncChat):
         self._current_facts = ["type", "perm", "size", "modify"]
         self._rnfr = None
         self._idler = None
+        # FTPMC state: (N, S) when enabled, else None
+        self._mc = None
+        self._mc_stripe = self.mc_default_stripe
+        # last data connection command was MPSV or MPRT
+        self._mc_expect_set = False
+        # preliminary reply held back until all connections are open
+        self._mc_pending_reply = None
         self._log_debug = (
             logging.getLogger("pyftpdlib").getEffectiveLevel() <= logging.DEBUG
         )
@@ -806,6 +848,12 @@ class FTPHandler(AsyncChat):
         if self._closed:
             return
         self._last_response = ""
+        if cmd in self._mc_transfer_cmds and self._mc_missing_set():
+            # FTPMC: a connection set in MODE S carries one transfer only
+            msg = "Use MPSV or MPRT first."
+            self.respond("425 " + msg)
+            self.log_cmd(cmd, args[0], 425, msg)
+            return
         method = getattr(self, "ftp_" + cmd.replace(" ", "_"))
         method(*args, **kwargs)
         if self._last_response:
@@ -876,6 +924,7 @@ class FTPHandler(AsyncChat):
         if self._dtp_connector is not None:
             self._dtp_connector.close()
             self._dtp_connector = None
+        self._mc_pending_reply = None
 
     # --- public callbacks
     # Note: to run a time consuming task make sure to use a separate
@@ -943,6 +992,11 @@ class FTPHandler(AsyncChat):
         if self._dtp_acceptor is not None:
             self._dtp_acceptor.close()
             self._dtp_acceptor = None
+
+        # FTPMC: the preliminary reply waited for all N connections
+        if self._mc_pending_reply is not None:
+            resp, self._mc_pending_reply = self._mc_pending_reply, None
+            self.respond(resp)
 
         # stop the idle timer as long as the data transfer is not finished
         if self._idler is not None and not self._idler.cancelled:
@@ -1020,6 +1074,7 @@ class FTPHandler(AsyncChat):
         if self.data_channel is not None:
             self.respond(
                 "125 Data connection already open. Transfer starting."
+                + self._mc_reply_suffix()
             )
             if file:
                 self.data_channel.file_obj = file
@@ -1035,8 +1090,9 @@ class FTPHandler(AsyncChat):
                 # dealing with this exception is up to DTP (see bug #84)
                 self.data_channel.handle_error()
         else:
-            self.respond(
+            self._respond_preliminary(
                 "150 File status okay. About to open data connection."
+                + self._mc_reply_suffix()
             )
             self._out_dtp_queue = (data, isproducer, file, cmd)
 
@@ -1065,6 +1121,10 @@ class FTPHandler(AsyncChat):
         self._in_dtp_queue = None
         self._rnfr = None
         self._out_dtp_queue = None
+        self._mc = None
+        self._mc_stripe = self.mc_default_stripe
+        self._mc_expect_set = False
+        self._mc_pending_reply = None
 
     def run_as_current_user(self, function, *args, **kwargs):
         """Execute a function impersonating the current logged-in user."""
@@ -1220,6 +1280,7 @@ class FTPHandler(AsyncChat):
 
         # close establishing DTP instances, if any
         self._shutdown_connecting_dtp()
+        self._mc_expect_set = False
 
         if self.data_channel is not None:
             self.data_channel.close()
@@ -1242,6 +1303,7 @@ class FTPHandler(AsyncChat):
         """
         # close establishing DTP instances, if any
         self._shutdown_connecting_dtp()
+        self._mc_expect_set = False
 
         # close established data connections, if any
         if self.data_channel is not None:
@@ -1256,6 +1318,205 @@ class FTPHandler(AsyncChat):
 
         # open data channel
         self._dtp_acceptor = self.passive_dtp(self, extmode)
+
+    # --- FTPMC (multiple data connections, see draft-ftpmc)
+
+    # commands that transfer data over the data connection
+    _mc_transfer_cmds = frozenset(
+        ("RETR", "STOR", "STOU", "APPE", "LIST", "NLST", "MLSD")
+    )
+
+    def _mc_missing_set(self):
+        """Return True if the last data connection command was MPSV or
+        MPRT and its connection set has already been used.
+        """
+        return (
+            self._mc_expect_set
+            and self.data_channel is None
+            and self._dtp_acceptor is None
+            and self._dtp_connector is None
+        )
+
+    def _mc_reply_suffix(self):
+        """Informative suffix for 125/150 replies on a connection set."""
+        mcset = None
+        if isinstance(self.data_channel, MCDataSet):
+            mcset = self.data_channel
+        elif isinstance(self._dtp_acceptor, MCPassive):
+            mcset = self._dtp_acceptor.mcset
+        elif isinstance(self._dtp_connector, MCActive):
+            mcset = self._dtp_connector.mcset
+        if mcset is None:
+            return ""
+        return f" (MC {mcset.n} {mcset.stripe})"
+
+    def _respond_preliminary(self, resp):
+        """Send a 150 reply, unless MPSV connections are still being
+        opened: then hold it back until all of them are established.
+        """
+        if isinstance(self._dtp_acceptor, MCPassive):
+            self._mc_pending_reply = resp
+        else:
+            self.respond(resp)
+
+    def _mc_discard_set(self):
+        """Close any connection set, established or being set up."""
+        if isinstance(self._dtp_acceptor, MCPassive) or isinstance(
+            self._dtp_connector, MCActive
+        ):
+            self._shutdown_connecting_dtp()
+        if isinstance(self.data_channel, MCDataSet):
+            self.data_channel.close()
+            self.data_channel = None
+
+    def _mc_data_connections_failed(self, timed_out=False, active=False):
+        """Called when the N data connections could not be established."""
+        if self._mc_pending_reply is not None:
+            # a transfer command is waiting: fail it
+            self._mc_pending_reply = None
+            if self._out_dtp_queue is not None:
+                file = self._out_dtp_queue[2]
+                if file is not None:
+                    file.close()
+                self._out_dtp_queue = None
+            if self._in_dtp_queue is not None:
+                self._in_dtp_queue[0].close()
+                self._in_dtp_queue = None
+            self.respond("425 Can't open all data connections.")
+        elif active:
+            self.respond("425 Can't connect to specified address.")
+        elif timed_out:
+            self.respond(
+                "421 Passive data channel timed out.", logfun=logger.info
+            )
+        else:
+            self.respond("425 Can't open all data connections.")
+
+    def _mc_opts(self, arg):
+        """OPTS MC <N> [<S>] | OPTS MC OFF"""
+        parts = arg.split()
+        if len(parts) == 1 and parts[0].upper() == "OFF":
+            self._mc_discard_set()
+            self._mc = None
+            self._mc_expect_set = False
+            self.respond("200 MC OFF")
+            return
+        if not 1 <= len(parts) <= 2 or not all(p.isdigit() for p in parts):
+            self.respond("501 Syntax: OPTS MC <connections> [<stripe>].")
+            return
+        n = int(parts[0])
+        stripe = int(parts[1]) if len(parts) == 2 else self._mc_stripe
+        if n < 1 or not 1 <= stripe <= MC_MAX_STRIPE:
+            self.respond(
+                "501 Connections must be at least 1 and stripe between 1"
+                f" and {MC_MAX_STRIPE}."
+            )
+            return
+        # lower the values to what this server supports
+        n = min(n, self.mc_max_connections)
+        stripe = min(stripe, self.mc_max_stripe)
+        self._mc_discard_set()
+        self._mc = (n, stripe)
+        self._mc_stripe = stripe
+        self.respond(f"200 MC {n} {stripe}")
+
+    def _mc_check_allowed(self):
+        """Reply and return False if a connection set can't be used."""
+        if self._mc is None:
+            self.respond("503 Enable FTPMC with OPTS MC first.")
+            return False
+        if getattr(self, "_prot", False):
+            # TLS on the data connections is not implemented for FTPMC
+            self.respond("534 FTPMC is not available with PROT P.")
+            return False
+        return True
+
+    def _mc_prepare(self):
+        """Close previous data connections; return False if no more
+        connections can be opened.
+        """
+        self._shutdown_connecting_dtp()
+        if self.data_channel is not None:
+            self.data_channel.close()
+            self.data_channel = None
+        if not self.server._accept_new_cons():
+            msg = "425 Too many connections. Can't open data channels."
+            self.respond_w_warning(msg)
+            return False
+        return True
+
+    def ftp_MPSV(self, line):
+        """Listen on N ports, one per data connection (FTPMC)."""
+        if not self._mc_check_allowed() or not self._mc_prepare():
+            return
+        n, stripe = self._mc
+        try:
+            self._dtp_acceptor = MCPassive(self, n, stripe)
+        except OSError as err:
+            self.respond(f"425 Can't open data connections: {strerror(err)}.")
+            return
+        self._mc_expect_set = True
+
+    def ftp_MPRT(self, line):
+        """Connect N data connections to the client's ports (FTPMC)."""
+        if self._epsvall:
+            self.respond("501 MPRT not allowed after EPSV ALL.")
+            return
+        if not self._mc_check_allowed():
+            return
+        n, stripe = self._mc
+        # <d>proto<d>ip<d>port,port,...<d>
+        try:
+            af, ip, ports = line.split(line[0])[1:-1]
+            ports = [int(p) for p in ports.split(",")]
+            for port in ports:
+                if not 0 < port <= 65535:
+                    raise ValueError
+        except (ValueError, IndexError):
+            self.respond("501 Invalid MPRT format.")
+            return
+        if len(ports) != n or len(set(ports)) != n:
+            self.respond(f"501 MPRT needs {n} distinct ports.")
+            return
+        if af == "1":
+            if (
+                self.socket.family == socket.AF_INET6
+                and not has_dualstack_ipv6()
+            ):
+                self.respond("522 Network protocol not supported (use 2).")
+                return
+            octs = ip.split(".")
+            if len(octs) != 4 or not all(
+                o.isdigit() and int(o) <= 255 for o in octs
+            ):
+                self.respond("501 Invalid MPRT format.")
+                return
+        elif af == "2":
+            if self.socket.family == socket.AF_INET:
+                self.respond("522 Network protocol not supported (use 1).")
+                return
+        else:
+            proto = "1" if self.socket.family == socket.AF_INET else "2"
+            self.respond(f"522 Network protocol not supported (use {proto}).")
+            return
+        # RFC-2577 bounce protection, mandatory in draft-ftpmc
+        remote_ip = self.remote_ip
+        if remote_ip.startswith("::ffff:"):
+            remote_ip = remote_ip[7:]
+        if not self.permit_foreign_addresses and ip != remote_ip:
+            self.respond_w_warning(
+                f"504 Rejected data connections to foreign address {ip}."
+            )
+            return
+        if not self.permit_privileged_ports and min(ports) < 1024:
+            self.respond_w_warning(
+                "504 MPRT against privileged ports refused."
+            )
+            return
+        if not self._mc_prepare():
+            return
+        self._dtp_connector = MCActive(self, n, stripe, ip, ports)
+        self._mc_expect_set = True
 
     def ftp_PORT(self, line):
         """Start an active data channel by using IPv4."""
@@ -1607,12 +1868,14 @@ class FTPHandler(AsyncChat):
 
             if self.data_channel is not None:
                 resp = "Data connection already open. Transfer starting."
-                self.respond("125 " + resp)
+                self.respond("125 " + resp + self._mc_reply_suffix())
                 self.data_channel.file_obj = fd
                 self.data_channel.enable_receiving(self._current_type, cmd)
             else:
                 resp = "File status okay. About to open data connection."
-                self.respond("150 " + resp)
+                self._respond_preliminary(
+                    "150 " + resp + self._mc_reply_suffix()
+                )
                 self._in_dtp_queue = (fd, cmd)
             return file
         except Exception:
@@ -1676,7 +1939,7 @@ class FTPHandler(AsyncChat):
                 self.data_channel.file_obj = fd
                 self.data_channel.enable_receiving(self._current_type, "STOU")
             else:
-                self.respond(f"150 FILE: {filename}")
+                self._respond_preliminary(f"150 FILE: {filename}")
                 self._in_dtp_queue = (fd, "STOU")
             return filename
         except Exception:
@@ -2212,6 +2475,8 @@ class FTPHandler(AsyncChat):
             features.add("MLST " + facts)
         if "REST" in self.proto_cmds:
             features.add("REST STREAM")
+        if self.mc_max_connections > 0 and "MPSV" in self.proto_cmds:
+            features.add(f"MC {self.mc_max_connections}")
         features = sorted(features)
         self.push("211-Features supported:\r\n")
         self.push("".join([f" {x}\r\n" for x in features]))
@@ -2219,6 +2484,9 @@ class FTPHandler(AsyncChat):
 
     def ftp_OPTS(self, line):
         """Specify options for FTP commands as specified in RFC-2389."""
+        if line.split(" ")[0].upper() == "MC" and self.mc_max_connections > 0:
+            self._mc_opts(line[2:])
+            return
         try:
             if line.count(" ") > 1:
                 raise ValueError("Invalid number of arguments")

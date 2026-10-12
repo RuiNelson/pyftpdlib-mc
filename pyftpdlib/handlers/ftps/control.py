@@ -153,7 +153,7 @@ class TLS_FTPHandler(SSLConnectionMixin, FTPHandler):
                 self.respond("550 " + msg)
                 self.log_cmd(cmd, args[0], 550, msg)
                 return
-        elif cmd in ("PASV", "EPSV", "PORT", "EPRT"):
+        elif cmd in ("PASV", "EPSV", "PORT", "EPRT", "MPSV", "MPRT"):
             if self.tls_data_required and not self._prot:
                 msg = "SSL/TLS required on the data channel."
                 self.respond("550 " + msg)

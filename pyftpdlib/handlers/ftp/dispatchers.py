@@ -41,7 +41,40 @@ class PassiveDTP(Acceptor):
         self.log = cmd_channel.log
         self.log_exception = cmd_channel.log_exception
         Acceptor.__init__(self, ioloop=cmd_channel.ioloop)
+        local_ip, masqueraded_ip = self._listen()
 
+        port = self.socket.getsockname()[1]
+        if not extmode:
+            ip = masqueraded_ip or local_ip
+            if ip.startswith("::ffff:"):
+                # In this scenario, the server has an IPv6 socket, but
+                # the remote client is using IPv4 and its address is
+                # represented as an IPv4-mapped IPv6 address which
+                # looks like this ::ffff:151.12.5.65, see:
+                # https://en.wikipedia.org/wiki/IPv6#IPv4-mapped_addresses
+                # https://datatracker.ietf.org/doc/html/rfc3493.html#section-3.7
+                # We truncate the first bytes to make it look like a
+                # common IPv4 address.
+                ip = ip[7:]
+            # The format of 227 response in not standardized.
+            # This is the most expected:
+            resp = "227 Entering passive mode (%s,%d,%d)." % (
+                ip.replace(".", ","),
+                port // 256,
+                port % 256,
+            )
+            self.cmd_channel.respond(resp)
+        else:
+            self.cmd_channel.respond(
+                f"229 Entering extended passive mode (|||{int(port)}|)."
+            )
+        if self.timeout:
+            self.call_later(self.timeout, self.handle_timeout)
+
+    def _listen(self):
+        """Create, bind and listen on the passive data socket.
+        Return the local IP address and the masqueraded one (if any).
+        """
         local_ip = self.cmd_channel.socket.getsockname()[0]
         if local_ip in self.cmd_channel.masquerade_address_map:
             masqueraded_ip = self.cmd_channel.masquerade_address_map[local_ip]
@@ -98,34 +131,7 @@ class PassiveDTP(Acceptor):
                 else:
                     break
         self.listen(self.backlog or self.cmd_channel.server.backlog)
-
-        port = self.socket.getsockname()[1]
-        if not extmode:
-            ip = masqueraded_ip or local_ip
-            if ip.startswith("::ffff:"):
-                # In this scenario, the server has an IPv6 socket, but
-                # the remote client is using IPv4 and its address is
-                # represented as an IPv4-mapped IPv6 address which
-                # looks like this ::ffff:151.12.5.65, see:
-                # https://en.wikipedia.org/wiki/IPv6#IPv4-mapped_addresses
-                # https://datatracker.ietf.org/doc/html/rfc3493.html#section-3.7
-                # We truncate the first bytes to make it look like a
-                # common IPv4 address.
-                ip = ip[7:]
-            # The format of 227 response in not standardized.
-            # This is the most expected:
-            resp = "227 Entering passive mode (%s,%d,%d)." % (
-                ip.replace(".", ","),
-                port // 256,
-                port % 256,
-            )
-            self.cmd_channel.respond(resp)
-        else:
-            self.cmd_channel.respond(
-                f"229 Entering extended passive mode (|||{int(port)}|)."
-            )
-        if self.timeout:
-            self.call_later(self.timeout, self.handle_timeout)
+        return local_ip, masqueraded_ip
 
     # --- connection / overridden
 
