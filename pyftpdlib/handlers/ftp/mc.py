@@ -8,8 +8,15 @@ See draft-ftpmc (https://github.com/RuiNelson/FTPMC). The data stream
 is cut into stripes of S octets and stripe i travels on connection
 i mod N. Only MODE S is implemented, so a connection set carries a
 single transfer and each connection signals end-of-data by closing.
+
+Uploads buffer future stripes and write only the contiguous stream prefix.
+REST + STOR preserves the accepted prefix and removes any old tail before
+receiving more data. With TYPE I, SIZE is sufficient to resume in a new
+session with a different connection count and stripe size. ASCII restart is not
+supported because file offsets need not match converted stream offsets.
 """
 
+import errno
 import os
 import socket
 
@@ -313,6 +320,15 @@ class MCDataSet:
 
     # --- receiving
 
+    def _write(self, data):
+        """Store every octet before advancing to subsequent stream data."""
+        pos = 0
+        while pos < len(data):
+            written = self.file_obj.write(data[pos:])
+            if written is None or not 0 < written <= len(data) - pos:
+                raise OSError(errno.EIO, "Incomplete file write")
+            pos += written
+
     def _posix_ascii_data_wrapper(self, chunk):
         if self._had_cr:
             chunk = b"\r" + chunk
@@ -353,7 +369,7 @@ class MCDataSet:
             if self._data_wrapper is not None:
                 data = self._data_wrapper(data)
             try:
-                self.file_obj.write(data)
+                self._write(data)
             except OSError as err:
                 self._fail(f"426 {strerror(err)}; transfer aborted.")
                 return
@@ -367,6 +383,14 @@ class MCDataSet:
                     )
                     return
             if all(ch.eof for ch in self.channels):
+                # A CR held back for a possible CRLF is itself data at EOF.
+                if self._had_cr:
+                    try:
+                        self._write(b"\r")
+                    except OSError as err:
+                        self._fail(f"426 {strerror(err)}; transfer aborted.")
+                        return
+                    self._had_cr = False
                 self.transfer_finished = True
                 self._finish("226 Transfer complete.", True)
 

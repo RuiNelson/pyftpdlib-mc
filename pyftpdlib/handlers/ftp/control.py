@@ -1786,6 +1786,9 @@ class FTPHandler(AsyncChat):
         """
         rest_pos = self._restart_position
         self._restart_position = 0
+        if rest_pos and self._mc_expect_set and self._current_type == "a":
+            self.respond("501 Resuming transfers not allowed in ASCII mode.")
+            return
         try:
             fd = self.run_as_current_user(self.fs.open, file, "rb")
         except (OSError, FilesystemError) as err:
@@ -1834,6 +1837,9 @@ class FTPHandler(AsyncChat):
         cmd = "APPE" if "a" in mode else "STOR"
         rest_pos = self._restart_position
         self._restart_position = 0
+        if rest_pos and self._mc_expect_set and self._current_type == "a":
+            self.respond("501 Resuming transfers not allowed in ASCII mode.")
+            return
         if rest_pos:
             mode = "r+"
         try:
@@ -1856,6 +1862,10 @@ class FTPHandler(AsyncChat):
                     if rest_pos > fsize:
                         raise ValueError
                     fd.seek(rest_pos)
+                    if self._mc_expect_set:
+                        # Keep a valid prefix even if the process stops before
+                        # any resumed data arrives. Ordinary FTP is unchanged.
+                        fd.truncate()
                     ok = 1
                 except ValueError:
                     why = f"REST position ({rest_pos}) > file size ({fsize})"

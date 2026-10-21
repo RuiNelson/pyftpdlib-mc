@@ -9,6 +9,8 @@ import os
 import select
 import socket
 import struct
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -20,6 +22,7 @@ from . import PASSWD
 from . import USER
 from . import FtpdThreadWrapper
 from . import PyftpdlibTestCase
+from . import call_until
 from . import close_client
 
 
@@ -224,6 +227,128 @@ class TestMC(PyftpdlibTestCase):
         self.client.voidresp()
         assert stripe_join(parts, stripe) == data[12345:]
 
+    def test_rest_stor_truncates_tail(self):
+        for tail, pending in ((b"xy", False), (b"", False), (b"xy", True)):
+            with self.subTest(tail=tail, pending=pending):
+                with open(self.testfn, "wb") as f:
+                    f.write(b"abcdeOLDTAIL")
+                n, stripe = self.enable(3, 2)
+                ports = self.mpsv()
+                if not pending:
+                    socks = self.connect_set(ports)
+                self.client.sendcmd("REST 5")
+                self.client.putcmd("STOR " + self.testfn)
+                if pending:
+                    call_until(
+                        lambda: os.path.getsize(self.testfn) == 5, "ret"
+                    )
+                    socks = self.connect_set(ports)
+                assert self.client.getresp().startswith(
+                    "150" if pending else "125"
+                )
+                # The old tail must disappear before any upload data arrives.
+                with open(self.testfn, "rb") as f:
+                    assert f.read() == b"abcde"
+                self.send_set(socks, stripe_split(tail, n, stripe))
+                self.client.voidresp()
+                with open(self.testfn, "rb") as f:
+                    assert f.read() == b"abcde" + tail
+
+    def test_rest_stor_invalid_prefix(self):
+        with open(self.testfn, "wb") as f:
+            f.write(b"abc")
+        self.enable(2, 4)
+        self.connect_set(self.mpsv())
+        self.client.sendcmd("REST 8")
+        with pytest.raises(ftplib.error_perm, match="554"):
+            self.client.sendcmd("STOR " + self.testfn)
+        with open(self.testfn, "rb") as f:
+            assert f.read() == b"abc"
+        missing = self.get_testfn()
+        self.client.sendcmd("REST 8")
+        with pytest.raises(ftplib.error_perm, match="550"):
+            self.client.sendcmd("STOR " + missing)
+        assert not os.path.exists(missing)
+
+    def test_rest_ascii_rejected(self):
+        with open(self.testfn, "wb") as f:
+            f.write(b"a\r\nb\r\nold")
+        for cmd in ("RETR", "STOR"):
+            with self.subTest(cmd=cmd):
+                self.client.sendcmd("TYPE A")
+                with pytest.raises(ftplib.error_perm, match="501"):
+                    self.client.sendcmd("REST 3")
+                self.client.sendcmd("TYPE I")
+                self.enable(2, 3)
+                self.connect_set(self.mpsv())
+                self.client.sendcmd("REST 3")
+                # TYPE must not make a pending binary offset safe for ASCII.
+                self.client.sendcmd("TYPE A")
+                with pytest.raises(ftplib.error_perm, match="501"):
+                    self.client.sendcmd(cmd + " " + self.testfn)
+                with open(self.testfn, "rb") as f:
+                    assert f.read() == b"a\r\nb\r\nold"
+
+    def test_upload_prefix_survives_process_exit(self):
+        # Kill the receiving process without allowing failure cleanup to run.
+        script = """
+import os
+import sys
+from pyftpdlib.authorizers import DummyAuthorizer
+from pyftpdlib.handlers import FTPHandler
+from pyftpdlib.servers import FTPServer
+auth = DummyAuthorizer()
+auth.add_user(sys.argv[1], sys.argv[2], os.getcwd(), perm="elradfmwMT")
+FTPHandler.authorizer = auth
+server = FTPServer(("127.0.0.1", 0), FTPHandler)
+print(server.socket.getsockname()[1], flush=True)
+server.serve_forever()
+"""
+        stripe = 16384
+        data = os.urandom(6 * stripe)
+        with subprocess.Popen(
+            [sys.executable, "-B", "-c", script, USER, PASSWD],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ) as proc:
+            ftp = ftplib.FTP(timeout=GLOBAL_TIMEOUT)
+            try:
+                ftp.connect("127.0.0.1", int(proc.stdout.readline()))
+                ftp.login(USER, PASSWD)
+                ftp.sendcmd("TYPE I")
+                ftp.sendcmd(f"OPTS MC 3 {stripe}")
+                resp = ftp.sendcmd("MPSV")
+                ports = resp.split("|")[3].split(",")
+                socks = self.connect_set([int(p) for p in ports])
+                ftp.sendcmd("STOR " + self.testfn)
+                # Future stripes arrive first and must remain buffered.
+                parts = stripe_split(data, 3, stripe)
+                socks[2].sendall(parts[2])
+                socks[0].sendall(parts[0][:stripe])
+                call_until(
+                    lambda: os.path.getsize(self.testfn) >= stripe, "ret"
+                )
+            finally:
+                proc.kill()
+                proc.wait(timeout=GLOBAL_TIMEOUT)
+                ftp.close()
+                for s in self.socks:
+                    s.close()
+        with open(self.testfn, "rb") as f:
+            prefix = f.read()
+        assert prefix == data[:stripe]
+        # A different server session and different N/S need only the file.
+        assert self.client.size(self.testfn) == len(prefix)
+        n, stripe = self.enable(2, 1000)
+        socks = self.connect_set(self.mpsv())
+        self.client.sendcmd(f"REST {len(prefix)}")
+        self.client.sendcmd("STOR " + self.testfn)
+        self.send_set(socks, stripe_split(data[len(prefix) :], n, stripe))
+        self.client.voidresp()
+        with open(self.testfn, "rb") as f:
+            assert f.read() == data
+
     def test_appe(self):
         with open(self.testfn, "wb") as f:
             f.write(b"head")
@@ -256,6 +381,52 @@ class TestMC(PyftpdlibTestCase):
         with open(self.testfn, "rb") as f:
             expected = "a\nb\nc\n".replace("\n", os.linesep).encode()
             assert f.read() == expected
+
+    def test_ascii_trailing_cr(self):
+        self.client.voidcmd("TYPE A")
+        n, stripe = self.enable(3, 2)
+        socks = self.connect_set(self.mpsv())
+        self.client.sendcmd("STOR " + self.testfn)
+        data = b"a\r\nb\r"
+        self.send_set(socks, stripe_split(data, n, stripe))
+        self.client.voidresp()
+        with open(self.testfn, "rb") as f:
+            assert f.read() == data.replace(b"\r\n", os.linesep.encode())
+
+    def test_short_file_writes(self):
+        class ShortWriter:
+            def __init__(self, file, limit):
+                self.file = file
+                self.limit = limit
+
+            def __getattr__(self, name):
+                return getattr(self.file, name)
+
+            def write(self, data):
+                return self.file.write(data[: self.limit])
+
+        data = b"abcdefghijklmnop"
+        for limit in (3, 0):
+            with self.subTest(limit=limit):
+                n, stripe = self.enable(3, 4)
+                socks = self.connect_set(self.mpsv())
+                self.client.sendcmd("STOR " + self.testfn)
+                with self.server.lock:
+                    session = next(
+                        h
+                        for h in self.server.server.ioloop.socket_map.values()
+                        if isinstance(h, self.server.handler)
+                    )
+                    mcset = session.data_channel
+                    mcset.file_obj = ShortWriter(mcset.file_obj, limit)
+                self.send_set(socks, stripe_split(data, n, stripe))
+                if limit:
+                    self.client.voidresp()
+                else:
+                    with pytest.raises(ftplib.error_temp, match="426"):
+                        self.client.voidresp()
+                with open(self.testfn, "rb") as f:
+                    assert f.read() == (data if limit else b"")
 
     # --- connection set rules
 
